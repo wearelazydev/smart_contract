@@ -1,172 +1,288 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "forge-std/Test.sol";
-import "../src/LazyToken.sol";
-import "../src/IssuesContract.sol";
-import "../src/ClaimContract.sol";
+import {Test, console2} from "forge-std/Test.sol";
+import {SwapToken} from "../src/SwapToken.sol";
+import {IssuesClaim} from "../src/IssuesClaim.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
-contract LazyTokenTest is Test {
-    LazyToken public lazyToken;
-    address public owner = address(1);
-    address public user = address(2);
+// mock token
+contract MockERC20 is ERC20 {
+    constructor() ERC20("LazyToken", "LAZY") {}
 
-    function setUp() public {
-        vm.startPrank(owner);
-        lazyToken = new LazyToken();
-        vm.stopPrank();
-    }
-
-    function testInitialSupply() public view {
-        assertEq(
-            lazyToken.balanceOf(owner),
-            1_000_000 * 10 ** lazyToken.decimals()
-        );
-    }
-
-    function testTokenTransfer() public {
-        uint256 transferAmount = 1000;
-        vm.prank(owner);
-        lazyToken.transfer(user, transferAmount);
-        assertEq(lazyToken.balanceOf(user), transferAmount);
-        assertEq(
-            lazyToken.balanceOf(owner),
-            1_000_000 * 10 ** lazyToken.decimals() - transferAmount
-        );
+    function mint(address to, uint256 amount) public {
+        _mint(to, amount);
     }
 }
 
-contract IssuesContractTest is Test {
-    LazyToken public lazyToken;
-    IssuesContract public issuesContract;
-    address public owner = address(1);
-    address public user = address(2);
-
+contract ContractTest is Test {
+    SwapToken public swapToken;
+    IssuesClaim public issuesClaim;
+    MockERC20 public lazyToken;
+    
+    address public owner;
+    address public user;
+    
     function setUp() public {
-        vm.startPrank(owner);
-        lazyToken = new LazyToken();
-        issuesContract = new IssuesContract(address(lazyToken));
-        vm.stopPrank();
+        owner = makeAddr("owner");
+        user = makeAddr("user");
+        
+        lazyToken = new MockERC20();
+        swapToken = new SwapToken(address(lazyToken));
+        issuesClaim = new IssuesClaim(address(lazyToken));
+        
+        lazyToken.mint(owner, 1000000 * 10**18);
+        lazyToken.mint(user, 1000000 * 10**18);
     }
 
-    function testCreateIssue() public {
+    // ============ SwapToken Tests ============
+
+    function testAddLiquidity() public {
+        uint256 tokenAmount = 1000;
+        uint256 ethAmount = 10 ether;
+
         vm.startPrank(owner);
-        uint256 bountyAmount = 1000;
-        lazyToken.approve(address(issuesContract), bountyAmount);
-        issuesContract.createIssue(
-            "GH123",
-            bountyAmount,
-            "Lazy Project",
-            "Test Description",
-            "https://github.com/test/repo",
-            block.timestamp + 1 days
-        );
-        IssuesContract.Issue memory issue = issuesContract.getIssueDetails(0);
-        assertEq(issue.bountyAmount, bountyAmount);
-        assertEq(issue.repoLink, "https://github.com/test/repo");
-        assertEq(lazyToken.balanceOf(address(issuesContract)), bountyAmount);
+        lazyToken.approve(address(swapToken), tokenAmount);
+        swapToken.addLiquidity(address(lazyToken), tokenAmount);
+        
+        vm.deal(owner, ethAmount);
+        swapToken.addLiquidity{value: ethAmount}(address(0), ethAmount);
         vm.stopPrank();
+
+        assertEq(swapToken.tokenBalances(address(lazyToken)), tokenAmount);
+        assertEq(swapToken.ethBalances(address(0)), ethAmount);
     }
 
-    function test_RevertWhen_CreateIssueWithoutApproval() public {
+    function testRemoveLiquidity() public {
+        uint256 tokenAmount = 1000;
+        uint256 ethAmount = 10 ether;
+
         vm.startPrank(owner);
+        lazyToken.approve(address(swapToken), tokenAmount);
+        swapToken.addLiquidity(address(lazyToken), tokenAmount);
+        
+        vm.deal(owner, ethAmount);
+        swapToken.addLiquidity{value: ethAmount}(address(0), ethAmount);
+
+        uint256 initialEthBalance = address(owner).balance;
+        uint256 initialTokenBalance = lazyToken.balanceOf(owner);
+
+        swapToken.removeLiquidity(address(0), ethAmount);
+        swapToken.removeLiquidity(address(lazyToken), tokenAmount);
+        vm.stopPrank();
+
+        assertEq(address(owner).balance - initialEthBalance, ethAmount);
+        assertEq(lazyToken.balanceOf(owner) - initialTokenBalance, tokenAmount);
+    }
+
+    
+    function testSwapWithLiquidity() public {
+        uint256 ethAmount = 10 ether;
+        uint256 tokenAmount = 1000;
+
+
+        vm.startPrank(owner);
+        lazyToken.approve(address(swapToken), tokenAmount);
+        swapToken.addLiquidity(address(lazyToken), tokenAmount);
+        vm.deal(owner, ethAmount);
+        swapToken.addLiquidity{value: ethAmount}(address(0), ethAmount);
+        vm.stopPrank();
+
+        uint256 swapAmount = 1 ether;
+        vm.deal(user, swapAmount);
+        
+        uint256 initialBalance = lazyToken.balanceOf(user);
+        
+        console2.log("Initial ETH pool:", ethAmount);
+        console2.log("Initial Token pool:", tokenAmount);
+        console2.log("Swap amount:", swapAmount);
+        
+
+        vm.prank(user);
+        swapToken.swap{value: swapAmount}(address(0), address(lazyToken), swapAmount);
+
+
+        uint256 actualOutput = lazyToken.balanceOf(user) - initialBalance;
+        
+        assertTrue(actualOutput > 0, "Swap output should be greater than 0");
+        assertTrue(actualOutput < tokenAmount, "Swap output should be less than total liquidity");
+
+        console2.log("Actual output received:", actualOutput);
+        
+        uint256 initialProduct = ethAmount * tokenAmount;
+        uint256 finalProduct = (ethAmount + swapAmount) * (tokenAmount - actualOutput);
+        assertTrue(finalProduct >= initialProduct * 99 / 100, "Constant product should be maintained within 1% tolerance");
+    }
+
+    function test_RevertWhen_IncorrectEthAmount() public {
+        uint256 ethAmount = 10 ether;
+        uint256 tokenAmount = 1000;
+
+        vm.startPrank(owner);
+        lazyToken.approve(address(swapToken), tokenAmount);
+        swapToken.addLiquidity(address(lazyToken), tokenAmount);
+        vm.deal(owner, ethAmount);
+        swapToken.addLiquidity{value: ethAmount}(address(0), ethAmount);
+        vm.stopPrank();
+
+        uint256 swapAmount = 1 ether;
+        vm.deal(user, swapAmount + 1);
+        vm.prank(user);
         vm.expectRevert();
-        issuesContract.createIssue(
-            "GH123",
-            1000,
-            "Lazy Project",
-            "Test Description",
-            "https://github.com/test/repo",
-            block.timestamp + 1 days
-        );
-        vm.stopPrank();
+        swapToken.swap{value: swapAmount + 1}(address(0), address(lazyToken), swapAmount);
     }
-}
 
-contract ClaimContractTest is Test {
-    LazyToken public lazyToken;
-    IssuesContract public issuesContract;
-    ClaimContract public claimContract;
-    address public owner = address(1);
-    address public developer = address(2);
+    function testCalculateSwap() public {
+        uint256 ethAmount = 10 ether;
+        uint256 tokenAmount = 1000;
 
-    function setUp() public {
-        // Deploy contracts as owner
         vm.startPrank(owner);
-        lazyToken = new LazyToken();
-        issuesContract = new IssuesContract(address(lazyToken));
-        claimContract = new ClaimContract(
+        lazyToken.approve(address(swapToken), tokenAmount);
+        swapToken.addLiquidity(address(lazyToken), tokenAmount);
+        vm.deal(owner, ethAmount);
+        swapToken.addLiquidity{value: ethAmount}(address(0), ethAmount);
+        vm.stopPrank();
+
+        uint256 swapAmount = 1 ether;
+        uint256 expectedOutput = swapToken.calculateSwap(
+            address(0),
             address(lazyToken),
-            address(issuesContract)
+            swapAmount
         );
 
-        // Create initial issue
+        assertTrue(expectedOutput > 0);
+        assertTrue(expectedOutput < tokenAmount);
+    }
+
+    // ============ IssuesClaim Tests ============
+
+    function test_CreateIssue() public {
         uint256 bountyAmount = 1000;
-        lazyToken.approve(address(issuesContract), bountyAmount);
-        issuesContract.createIssue(
-            "GH123",
+        uint256 deadline = block.timestamp + 1 days;
+        
+        vm.startPrank(owner);
+        lazyToken.approve(address(issuesClaim), bountyAmount);
+        
+        issuesClaim.createIssue(
+            "project-1",
             bountyAmount,
-            "Lazy Project",
+            "Test Project",
             "Test Description",
-            "https://github.com/test/repo",
-            block.timestamp + 1 days
+            "https://github.com/test",
+            deadline
         );
         vm.stopPrank();
 
-        // Approve ClaimContract to spend tokens from IssuesContract
-        vm.prank(address(issuesContract));
-        lazyToken.approve(address(claimContract), bountyAmount);
+        IssuesClaim.Issue memory issue = issuesClaim.getIssueDetails(0);
+        assertEq(issue.bountyAmount, bountyAmount);
+        assertEq(issue.owner, owner);
+        assertTrue(issue.isOpen);
     }
 
-    function testClaimReward() public {
-        vm.startPrank(developer);
-        uint256 issueId = 0;
-        string memory prLink = "https://github.com/test/repo/pull/1";
-
-        // Simulate backend verification
-        claimContract.claimReward(issueId, prLink, true);
-
-        // Check balances
-        assertEq(lazyToken.balanceOf(developer), 1000);
-        assertTrue(claimContract.verifyMergeStatus(prLink));
-
-        // Check response
-        ClaimContract.Response memory response = claimContract.getClaimResponse(
-            issueId
+    function test_ClaimReward() public {
+        uint256 bountyAmount = 1000;
+        uint256 deadline = block.timestamp + 1 days;
+        
+        vm.startPrank(owner);
+        lazyToken.approve(address(issuesClaim), bountyAmount);
+        issuesClaim.createIssue(
+            "project-1",
+            bountyAmount,
+            "Test Project",
+            "Test Description",
+            "https://github.com/test",
+            deadline
         );
-        assertEq(response.issueId, issueId);
+        vm.stopPrank();
+
+        string memory prLink = "https://github.com/test/pull/1";
+        vm.prank(user);
+        issuesClaim.claimReward(0, prLink, true);
+
+        assertEq(lazyToken.balanceOf(user), 1000000 * 10**18 + bountyAmount);
+        assertTrue(issuesClaim.verifyMergeStatus(prLink));
+    }
+
+    function testFail_ClaimRewardAfterDeadline() public {
+        uint256 bountyAmount = 1000;
+        uint256 deadline = block.timestamp + 1 days;
+        
+        vm.startPrank(owner);
+        lazyToken.approve(address(issuesClaim), bountyAmount);
+        issuesClaim.createIssue(
+            "project-1",
+            bountyAmount,
+            "Test Project",
+            "Test Description",
+            "https://github.com/test",
+            deadline
+        );
+        vm.stopPrank();
+
+        vm.warp(deadline + 1);
+
+        vm.prank(user);
+        issuesClaim.claimReward(0, "https://github.com/test/pull/1", true);
+    }
+
+    function test_GetClaimResponse() public {
+        uint256 bountyAmount = 1000;
+        uint256 deadline = block.timestamp + 1 days;
+        string memory prLink = "https://github.com/test/pull/1";
+        
+        vm.startPrank(owner);
+        lazyToken.approve(address(issuesClaim), bountyAmount);
+        issuesClaim.createIssue(
+            "project-1",
+            bountyAmount,
+            "Test Project",
+            "Test Description",
+            "https://github.com/test",
+            deadline
+        );
+        vm.stopPrank();
+
+        vm.prank(user);
+        issuesClaim.claimReward(0, prLink, true);
+
+        IssuesClaim.Response memory response = issuesClaim.getClaimResponse(0);
+        assertEq(response.issueId, 0);
         assertEq(response.prLink, prLink);
-        assertEq(response.bountyAmount, 1000);
-        assertEq(response.developer, developer);
+        assertEq(response.bountyAmount, bountyAmount);
+        assertEq(response.developer, user);
         assertTrue(response.isApproved);
-
-        vm.stopPrank();
     }
 
-    function test_RevertWhen_ClaimUnmergedPR() public {
-        vm.startPrank(developer);
-        uint256 issueId = 0;
-        string memory prLink = "https://github.com/test/repo/pull/1";
-
-        // Expect revert karena PR belum di-merge
-        vm.expectRevert();
-        claimContract.claimReward(issueId, prLink, false);
-
+    function testFail_DuplicatePRLink() public {
+        uint256 bountyAmount = 1000;
+        uint256 deadline = block.timestamp + 1 days;
+        string memory prLink = "https://github.com/test/pull/1";
+        
+        vm.startPrank(owner);
+        lazyToken.approve(address(issuesClaim), bountyAmount * 2);
+        
+        issuesClaim.createIssue(
+            "project-1",
+            bountyAmount,
+            "Test Project 1",
+            "Test Description",
+            "https://github.com/test",
+            deadline
+        );
+        
+        issuesClaim.createIssue(
+            "project-2",
+            bountyAmount,
+            "Test Project 2",
+            "Test Description",
+            "https://github.com/test",
+            deadline
+        );
         vm.stopPrank();
-    }
 
-    function test_RevertWhen_ClaimWithUsedPR() public {
-        vm.startPrank(developer);
-        uint256 issueId = 0;
-        string memory prLink = "https://github.com/test/repo/pull/1";
-
-        // Pertama kali berhasil
-        claimContract.claimReward(issueId, prLink, true);
-
-        // Expect revert karena PR sudah digunakan
-        vm.expectRevert();
-        claimContract.claimReward(issueId, prLink, true);
-
+        vm.startPrank(user);
+        issuesClaim.claimReward(0, prLink, true);
+        issuesClaim.claimReward(1, prLink, true); // This should fail
         vm.stopPrank();
     }
 }
